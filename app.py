@@ -407,9 +407,14 @@ a {
     color: var(--text-primary) !important;
 }
 
-/* ── Hide Streamlit branding (optional, cleaner look) ───────────── */
-#MainMenu, header[data-testid="stHeader"], footer {
+/* ── Hide Streamlit branding (keep sidebar toggle visible) ──────── */
+#MainMenu, footer {
     visibility: hidden;
+}
+
+header[data-testid="stHeader"] {
+    background: transparent !important;
+    border: none !important;
 }
 </style>
 """
