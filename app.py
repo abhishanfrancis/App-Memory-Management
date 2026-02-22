@@ -16,6 +16,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import threading
 import time
 import pandas as pd
 import plotly.graph_objects as go
@@ -23,7 +24,7 @@ import streamlit as st
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-from config import REFRESH_INTERVAL_MS, KILL_BLOCKLIST, CACHE_TTL_SECONDS
+from config import REFRESH_INTERVAL_MS, KILL_BLOCKLIST, CACHE_TTL_SECONDS, ADB_TIMEOUT_SECONDS
 from modules.adb_utils import is_device_connected, get_device_info, force_stop_app, force_stop_batch
 from modules.memory_reader import MemoryInfo, get_system_memory
 from modules.process_reader import ProcessInfo, get_running_processes
@@ -60,6 +61,10 @@ if "kill_log" not in st.session_state:
     st.session_state.kill_log = []          # list of {time, package, pss_mb, status}
 if "auto_refresh_on" not in st.session_state:
     st.session_state.auto_refresh_on = False
+if "app_mode" not in st.session_state:
+    st.session_state.app_mode = None        # None = not chosen, "demo", "live"
+if "device_connected" not in st.session_state:
+    st.session_state.device_connected = False
 
 # Only auto-refresh when user explicitly enables it
 if st.session_state.auto_refresh_on:
@@ -73,42 +78,57 @@ if st.session_state.auto_refresh_on:
 _GLASSMORPHISM_CSS = """
 <style>
 /* ── Import modern font ─────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
 /* ── Root variables ─────────────────────────────────────────────── */
 :root {
-    --glass-bg: rgba(255, 255, 255, 0.04);
-    --glass-border: rgba(255, 255, 255, 0.08);
-    --glass-blur: 20px;
-    --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    --glass-bg: rgba(255, 255, 255, 0.035);
+    --glass-border: rgba(255, 255, 255, 0.07);
+    --glass-blur: 24px;
+    --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
     --accent-blue: #00d4ff;
     --accent-cyan: #00f0ff;
     --accent-purple: #a855f7;
     --accent-pink: #ec4899;
     --accent-green: #10b981;
     --accent-red: #ef4444;
-    --text-primary: #f0f0f0;
-    --text-secondary: rgba(255, 255, 255, 0.55);
-    --radius: 16px;
+    --text-primary: #eef1f5;
+    --text-secondary: rgba(255, 255, 255, 0.50);
+    --radius: 14px;
 }
 
-/* ── Global background gradient ─────────────────────────────────── */
+/* ── Kill ALL top padding / margins from Streamlit chrome ───────── */
+.stApp > header { display: none !important; }
+header[data-testid="stHeader"] { display: none !important; }
+#MainMenu, footer, [data-testid="stDecoration"] { display: none !important; }
+
+[data-testid="stAppViewBlockContainer"],
+[data-testid="stMainBlockContainer"],
+.block-container {
+    padding-top: 1rem !important;
+    max-width: 100% !important;
+}
+
+[data-testid="stSidebar"] > div:first-child {
+    padding-top: 1.2rem !important;
+}
+
+/* ── Global background ──────────────────────────────────────────── */
 .stApp, [data-testid="stAppViewContainer"] {
-    background: linear-gradient(135deg, #0a0a1a 0%, #0d1b2a 25%, #1b1040 50%, #0d1b2a 75%, #0a0a1a 100%) !important;
+    background: linear-gradient(160deg, #060714 0%, #0b1120 30%, #140e2e 55%, #0b1120 80%, #060714 100%) !important;
     background-attachment: fixed !important;
     font-family: 'Inter', sans-serif !important;
     color: var(--text-primary) !important;
 }
 
-/* Subtle animated gradient overlay */
+/* Subtle ambient glow */
 .stApp::before {
     content: '';
     position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;
     background:
-        radial-gradient(ellipse at 20% 20%, rgba(0, 212, 255, 0.06) 0%, transparent 50%),
-        radial-gradient(ellipse at 80% 80%, rgba(168, 85, 247, 0.06) 0%, transparent 50%),
-        radial-gradient(ellipse at 50% 50%, rgba(236, 72, 153, 0.03) 0%, transparent 50%);
+        radial-gradient(ellipse 50% 40% at 15% 15%, rgba(0,212,255,0.045) 0%, transparent 100%),
+        radial-gradient(ellipse 50% 40% at 85% 75%, rgba(168,85,247,0.04) 0%, transparent 100%);
     pointer-events: none;
     z-index: 0;
 }
@@ -119,8 +139,8 @@ _GLASSMORPHISM_CSS = """
 
 /* ── Sidebar ────────────────────────────────────────────────────── */
 [data-testid="stSidebar"] {
-    background: linear-gradient(180deg, rgba(13, 27, 42, 0.95) 0%, rgba(10, 10, 26, 0.98) 100%) !important;
-    border-right: 1px solid var(--glass-border) !important;
+    background: linear-gradient(180deg, rgba(8,15,28,0.97) 0%, rgba(6,7,20,0.99) 100%) !important;
+    border-right: 1px solid rgba(255,255,255,0.05) !important;
     backdrop-filter: blur(30px) !important;
     -webkit-backdrop-filter: blur(30px) !important;
 }
@@ -135,30 +155,37 @@ _GLASSMORPHISM_CSS = """
     -webkit-text-fill-color: transparent !important;
     background-clip: text !important;
     font-weight: 700 !important;
+    font-size: 1.3rem !important;
 }
 
-/* ── Main title gradient ────────────────────────────────────────── */
+/* ── Main title ─────────────────────────────────────────────────── */
 [data-testid="stMainBlockContainer"] h1 {
     background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-blue) 40%, var(--accent-purple) 100%) !important;
     -webkit-background-clip: text !important;
     -webkit-text-fill-color: transparent !important;
     background-clip: text !important;
-    font-weight: 700 !important;
-    font-size: 2.2rem !important;
-    letter-spacing: -0.5px !important;
-    padding-bottom: 0.3rem !important;
+    font-weight: 800 !important;
+    font-size: 1.75rem !important;
+    letter-spacing: -0.6px !important;
+    padding-bottom: 0 !important;
+    margin-bottom: 0 !important;
+    line-height: 1.25 !important;
 }
 
 /* Sub-headers */
 h2, h3, [data-testid="stSubheader"] {
-    color: rgba(255, 255, 255, 0.9) !important;
+    color: rgba(255, 255, 255, 0.88) !important;
     font-weight: 600 !important;
     letter-spacing: -0.3px !important;
+    font-size: 1.1rem !important;
+    margin-top: 0.6rem !important;
 }
 
-/* Captions */
+/* Captions — tighter */
 [data-testid="stCaptionContainer"], .stCaption {
     color: var(--text-secondary) !important;
+    margin-top: -2px !important;
+    margin-bottom: 4px !important;
 }
 
 /* ── Glass card for metric containers ───────────────────────────── */
@@ -166,31 +193,31 @@ h2, h3, [data-testid="stSubheader"] {
     background: var(--glass-bg) !important;
     border: 1px solid var(--glass-border) !important;
     border-radius: var(--radius) !important;
-    padding: 20px 24px !important;
+    padding: 16px 20px !important;
     backdrop-filter: blur(var(--glass-blur)) !important;
     -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
-    box-shadow: var(--glass-shadow), inset 0 1px 0 rgba(255,255,255,0.05) !important;
-    transition: transform 0.2s ease, box-shadow 0.2s ease !important;
+    box-shadow: var(--glass-shadow), inset 0 1px 0 rgba(255,255,255,0.04) !important;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease !important;
 }
 
 [data-testid="stMetric"]:hover {
     transform: translateY(-2px) !important;
-    box-shadow: 0 12px 40px rgba(0, 212, 255, 0.15), inset 0 1px 0 rgba(255,255,255,0.08) !important;
-    border-color: rgba(0, 212, 255, 0.2) !important;
+    box-shadow: 0 12px 40px rgba(0,212,255,0.12), inset 0 1px 0 rgba(255,255,255,0.06) !important;
+    border-color: rgba(0,212,255,0.18) !important;
 }
 
 [data-testid="stMetric"] label {
     color: var(--text-secondary) !important;
-    font-size: 0.85rem !important;
-    font-weight: 500 !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
     text-transform: uppercase !important;
-    letter-spacing: 0.8px !important;
+    letter-spacing: 1px !important;
 }
 
 [data-testid="stMetric"] [data-testid="stMetricValue"] {
     color: var(--accent-cyan) !important;
     font-weight: 700 !important;
-    font-size: 1.8rem !important;
+    font-size: 1.55rem !important;
 }
 
 [data-testid="stMetric"] [data-testid="stMetricDelta"] {
@@ -200,34 +227,46 @@ h2, h3, [data-testid="stSubheader"] {
 /* ── Tabs ───────────────────────────────────────────────────────── */
 [data-testid="stTabs"] {
     background: transparent !important;
+    margin-top: 0.25rem !important;
+}
+
+/* Equal-width tabs */
+[data-testid="stTabs"] [role="tablist"] {
+    display: flex !important;
+    width: 100% !important;
+}
+
+[data-testid="stTabs"] [role="tablist"] > * {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
 }
 
 button[data-baseweb="tab"] {
-    background: var(--glass-bg) !important;
-    border: 1px solid var(--glass-border) !important;
-    border-radius: 12px 12px 0 0 !important;
+    background: transparent !important;
+    border: none !important;
+    border-bottom: 2px solid transparent !important;
+    border-radius: 0 !important;
     color: var(--text-secondary) !important;
     font-family: 'Inter', sans-serif !important;
     font-weight: 500 !important;
-    font-size: 0.9rem !important;
-    padding: 12px 20px !important;
-    backdrop-filter: blur(10px) !important;
-    -webkit-backdrop-filter: blur(10px) !important;
-    transition: all 0.25s ease !important;
+    font-size: 0.84rem !important;
+    padding: 10px 8px !important;
+    transition: all 0.2s ease !important;
+    width: 100% !important;
+    text-align: center !important;
+    justify-content: center !important;
 }
 
 button[data-baseweb="tab"]:hover {
-    background: rgba(0, 212, 255, 0.08) !important;
+    background: rgba(0,212,255,0.04) !important;
     color: var(--accent-cyan) !important;
-    border-color: rgba(0, 212, 255, 0.2) !important;
 }
 
 button[data-baseweb="tab"][aria-selected="true"] {
-    background: rgba(0, 212, 255, 0.1) !important;
+    background: transparent !important;
     color: var(--accent-cyan) !important;
-    border-bottom: 2px solid var(--accent-cyan) !important;
-    border-color: rgba(0, 212, 255, 0.25) !important;
-    border-bottom-color: var(--accent-cyan) !important;
+    border-bottom: none !important;
+    font-weight: 600 !important;
 }
 
 [data-baseweb="tab-highlight"] {
@@ -235,28 +274,27 @@ button[data-baseweb="tab"][aria-selected="true"] {
 }
 
 [data-baseweb="tab-border"] {
-    background-color: var(--glass-border) !important;
+    background-color: rgba(255,255,255,0.05) !important;
 }
 
 /* ── Buttons ────────────────────────────────────────────────────── */
 .stButton > button {
-    background: linear-gradient(135deg, rgba(0, 212, 255, 0.15) 0%, rgba(168, 85, 247, 0.15) 100%) !important;
-    border: 1px solid rgba(0, 212, 255, 0.25) !important;
-    border-radius: 12px !important;
+    background: rgba(0,212,255,0.08) !important;
+    border: 1px solid rgba(0,212,255,0.18) !important;
+    border-radius: 10px !important;
     color: var(--accent-cyan) !important;
     font-family: 'Inter', sans-serif !important;
     font-weight: 600 !important;
-    padding: 10px 24px !important;
-    backdrop-filter: blur(10px) !important;
-    -webkit-backdrop-filter: blur(10px) !important;
-    transition: all 0.25s ease !important;
-    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2) !important;
+    font-size: 0.82rem !important;
+    padding: 8px 20px !important;
+    transition: all 0.2s ease !important;
+    box-shadow: none !important;
 }
 
 .stButton > button:hover {
-    background: linear-gradient(135deg, rgba(0, 212, 255, 0.25) 0%, rgba(168, 85, 247, 0.25) 100%) !important;
-    border-color: var(--accent-cyan) !important;
-    box-shadow: 0 6px 25px rgba(0, 212, 255, 0.2) !important;
+    background: rgba(0,212,255,0.15) !important;
+    border-color: rgba(0,212,255,0.35) !important;
+    box-shadow: 0 4px 20px rgba(0,212,255,0.12) !important;
     transform: translateY(-1px) !important;
     color: #ffffff !important;
 }
@@ -265,31 +303,31 @@ button[data-baseweb="tab"][aria-selected="true"] {
     transform: translateY(0px) !important;
 }
 
-/* Primary buttons (Optimize Now) */
+/* Primary buttons */
 .stButton > button[kind="primary"],
 .stButton > button[data-testid="stBaseButton-primary"] {
     background: linear-gradient(135deg, var(--accent-blue) 0%, var(--accent-purple) 100%) !important;
     color: #ffffff !important;
     border: none !important;
-    box-shadow: 0 4px 20px rgba(0, 212, 255, 0.3) !important;
+    box-shadow: 0 4px 20px rgba(0,212,255,0.25) !important;
 }
 
 .stButton > button[kind="primary"]:hover,
 .stButton > button[data-testid="stBaseButton-primary"]:hover {
-    box-shadow: 0 6px 30px rgba(0, 212, 255, 0.45) !important;
+    box-shadow: 0 6px 30px rgba(0,212,255,0.4) !important;
 }
 
 /* ── Progress bar ───────────────────────────────────────────────── */
 [data-testid="stProgress"] > div > div {
-    background: rgba(255, 255, 255, 0.06) !important;
-    border-radius: 10px !important;
+    background: rgba(255,255,255,0.05) !important;
+    border-radius: 8px !important;
     overflow: hidden !important;
 }
 
 [data-testid="stProgress"] [role="progressbar"] {
-    background: linear-gradient(90deg, var(--accent-blue) 0%, var(--accent-cyan) 50%, var(--accent-purple) 100%) !important;
-    border-radius: 10px !important;
-    box-shadow: 0 0 15px rgba(0, 212, 255, 0.35) !important;
+    background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan), var(--accent-purple)) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 0 12px rgba(0,212,255,0.3) !important;
 }
 
 /* ── DataFrames / Tables ────────────────────────────────────────── */
@@ -303,48 +341,47 @@ button[data-baseweb="tab"][aria-selected="true"] {
     overflow: hidden !important;
 }
 
-/* ── Alerts (success / warning / error / info) ──────────────────── */
+/* ── Alerts ─────────────────────────────────────────────────────── */
 [data-testid="stAlert"] {
-    border-radius: 12px !important;
+    border-radius: 10px !important;
     backdrop-filter: blur(10px) !important;
     -webkit-backdrop-filter: blur(10px) !important;
     border: 1px solid var(--glass-border) !important;
+    font-size: 0.88rem !important;
 }
 
-/* Success */
-[data-testid="stAlert"][data-baseweb*="positive"],
 div[data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]) {
-    background: rgba(16, 185, 129, 0.1) !important;
-    border-color: rgba(16, 185, 129, 0.25) !important;
+    background: rgba(16,185,129,0.08) !important;
+    border-color: rgba(16,185,129,0.2) !important;
 }
 
-/* Warning */
 div[data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) {
-    background: rgba(245, 158, 11, 0.1) !important;
-    border-color: rgba(245, 158, 11, 0.25) !important;
+    background: rgba(245,158,11,0.08) !important;
+    border-color: rgba(245,158,11,0.2) !important;
 }
 
-/* Error */
 div[data-testid="stAlert"]:has([data-testid="stAlertContentError"]) {
-    background: rgba(239, 68, 68, 0.1) !important;
-    border-color: rgba(239, 68, 68, 0.25) !important;
+    background: rgba(239,68,68,0.08) !important;
+    border-color: rgba(239,68,68,0.2) !important;
 }
 
-/* Info */
 div[data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]) {
-    background: rgba(0, 212, 255, 0.08) !important;
-    border-color: rgba(0, 212, 255, 0.2) !important;
+    background: rgba(0,212,255,0.06) !important;
+    border-color: rgba(0,212,255,0.15) !important;
 }
 
 /* ── Dividers ───────────────────────────────────────────────────── */
 [data-testid="stDivider"], hr {
-    border-color: var(--glass-border) !important;
-    opacity: 0.5 !important;
+    border-color: rgba(255,255,255,0.05) !important;
+    opacity: 0.6 !important;
+    margin-top: 0.5rem !important;
+    margin-bottom: 0.5rem !important;
 }
 
 /* ── Toggle / Switch ────────────────────────────────────────────── */
 [data-testid="stToggle"] label span {
     color: var(--text-secondary) !important;
+    font-size: 0.85rem !important;
 }
 
 /* ── Expanders ──────────────────────────────────────────────────── */
@@ -364,57 +401,44 @@ div[data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]) {
     backdrop-filter: blur(var(--glass-blur)) !important;
     -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
     box-shadow: var(--glass-shadow) !important;
-    padding: 8px !important;
+    padding: 6px !important;
 }
 
-/* ── Columns — kill-button rows ─────────────────────────────────── */
+/* ── Columns gap ────────────────────────────────────────────────── */
 [data-testid="stHorizontalBlock"] {
-    gap: 0.6rem !important;
+    gap: 0.5rem !important;
 }
 
-/* ── Scroll & Selection colors ──────────────────────────────────── */
-::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
-}
-::-webkit-scrollbar-track {
-    background: rgba(255,255,255,0.02);
-}
-::-webkit-scrollbar-thumb {
-    background: rgba(0, 212, 255, 0.2);
-    border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-    background: rgba(0, 212, 255, 0.35);
-}
+/* ── Scrollbar ──────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(0,212,255,0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,212,255,0.3); }
 
-::selection {
-    background: rgba(0, 212, 255, 0.3);
-    color: #ffffff;
-}
+::selection { background: rgba(0,212,255,0.25); color: #fff; }
 
 /* ── Links ──────────────────────────────────────────────────────── */
-a {
-    color: var(--accent-cyan) !important;
-}
+a { color: var(--accent-cyan) !important; }
 
-/* ── Toast notifications ────────────────────────────────────────── */
+/* ── Toast ──────────────────────────────────────────────────────── */
 [data-testid="stToast"] {
-    background: rgba(13, 27, 42, 0.9) !important;
+    background: rgba(8,15,28,0.92) !important;
     border: 1px solid var(--glass-border) !important;
-    border-radius: 12px !important;
+    border-radius: 10px !important;
     backdrop-filter: blur(20px) !important;
     color: var(--text-primary) !important;
 }
 
-/* ── Hide Streamlit branding (keep sidebar toggle visible) ──────── */
-#MainMenu, footer {
-    visibility: hidden;
+/* ── Multiselect/select ─────────────────────────────────────────── */
+[data-baseweb="select"], [data-baseweb="input"] {
+    border-radius: 10px !important;
 }
 
-header[data-testid="stHeader"] {
-    background: transparent !important;
-    border: none !important;
+[data-baseweb="popover"] {
+    border-radius: 10px !important;
+    border: 1px solid var(--glass-border) !important;
+    background: rgba(8,15,28,0.95) !important;
+    backdrop-filter: blur(20px) !important;
 }
 </style>
 """
@@ -423,34 +447,314 @@ st.markdown(_GLASSMORPHISM_CSS, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  DATA COLLECTION (live vs demo)
+#  DATA COLLECTION — Non-blocking background fetcher
 # ═══════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS)
-def collect_data():
-    """Fetch memory + process data.  Returns (memory, processes, device_info, is_live)."""
+# Module-level thread-safe cache so ADB calls never block the UI render.
+_bg_lock = threading.Lock()
+_bg_live_data = None        # (memory, processes, device_info) or None
+_bg_live_time: float = 0.0  # epoch when last fetch completed
+_bg_thread = None            # reference to the running fetcher thread
+
+
+def _bg_fetch_live():
+    """Worker: fetch live data in background, store in module-level cache."""
+    global _bg_live_data, _bg_live_time
     try:
-        live = is_device_connected()
+        memory = get_system_memory()
+        processes = get_running_processes()
+        device_info = get_device_info()
+        with _bg_lock:
+            _bg_live_data = (memory, processes, device_info)
+            _bg_live_time = time.time()
     except Exception:
-        live = False
+        pass  # keep serving last-known-good data
 
-    if live:
+
+def collect_live_data(force: bool = False):
+    """Return live device data without blocking the UI.
+
+    • If fresh cached data exists (< CACHE_TTL_SECONDS old), return it
+      instantly and kick off a background refresh for next cycle.
+    • If no data exists yet (first load), block briefly until the
+      background thread delivers.
+    • *force=True* resets the cache age so the next call triggers a fetch.
+    """
+    global _bg_thread
+
+    with _bg_lock:
+        data = _bg_live_data
+        age = time.time() - _bg_live_time
+
+    # Kick off a background fetch if data is stale or missing
+    need_fetch = data is None or age > CACHE_TTL_SECONDS or force
+    if need_fetch and (_bg_thread is None or not _bg_thread.is_alive()):
+        _bg_thread = threading.Thread(target=_bg_fetch_live, daemon=True)
+        _bg_thread.start()
+
+    # First-ever load: we must wait for *some* data to arrive
+    if data is None and _bg_thread is not None:
+        _bg_thread.join(timeout=ADB_TIMEOUT_SECONDS + 5)
+        with _bg_lock:
+            data = _bg_live_data
+        if data is None:
+            raise RuntimeError("Unable to fetch data from device")
+
+    return data
+
+
+def clear_live_cache():
+    """Invalidate the background cache so the next call triggers a fresh fetch."""
+    global _bg_live_data, _bg_live_time
+    with _bg_lock:
+        _bg_live_time = 0.0  # mark as stale; keep old data for display
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS)
+def collect_demo_data():
+    """Return realistic simulated data (cached to prevent flicker on rerun)."""
+    return get_fake_memory(), get_fake_processes(), get_fake_device_info()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MODE SELECTION SCREEN
+# ═══════════════════════════════════════════════════════════════════════
+
+def _render_mode_selection():
+    """Show the mode selection landing page."""
+    st.markdown(
+        '<div style="text-align:center;padding:40px 0 10px;">'
+        '<span style="font-size:3.5rem;">📱</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<h1 style="text-align:center;background:linear-gradient(135deg,#00d4ff,#a855f7);'
+        '-webkit-background-clip:text;-webkit-text-fill-color:transparent;'
+        'font-weight:700;margin-bottom:4px;">'
+        'Mobile OS Memory Management System</h1>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p style="text-align:center;color:rgba(255,255,255,0.55);font-size:1rem;margin-bottom:40px;">'
+        'Real-time adaptive memory monitoring, analysis &amp; optimization</p>',
+        unsafe_allow_html=True,
+    )
+
+    col_left, col_demo, col_gap, col_live, col_right = st.columns([1, 2, 0.5, 2, 1])
+
+    with col_demo:
+        st.markdown(
+            '<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);'
+            'border-radius:16px;padding:30px 24px;text-align:center;'
+            'backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);">'
+            '<div style="font-size:2.5rem;margin-bottom:12px;">🖥️</div>'
+            '<div style="font-size:1.15rem;font-weight:700;color:#f0f0f0;margin-bottom:8px;">Demo Mode</div>'
+            '<div style="font-size:0.85rem;color:rgba(255,255,255,0.55);line-height:1.5;margin-bottom:20px;">'
+            'Explore the dashboard with realistic simulated data.<br/>'
+            'No Android device required.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("🖥️  Start Demo Mode", key="btn_demo", use_container_width=True):
+            st.session_state.app_mode = "demo"
+            st.rerun()
+
+    with col_live:
+        st.markdown(
+            '<div style="background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2);'
+            'border-radius:16px;padding:30px 24px;text-align:center;'
+            'backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);">'
+            '<div style="font-size:2.5rem;margin-bottom:12px;">📲</div>'
+            '<div style="font-size:1.15rem;font-weight:700;color:#00d4ff;margin-bottom:8px;">Live Mode</div>'
+            '<div style="font-size:0.85rem;color:rgba(255,255,255,0.55);line-height:1.5;margin-bottom:20px;">'
+            'Connect a real Android device via USB.<br/>'
+            'Monitor &amp; manage memory in real-time.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("📲  Start Live Mode", key="btn_live", use_container_width=True):
+            st.session_state.app_mode = "live"
+            st.session_state.device_connected = False
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  LIVE MODE — CONNECTION WIZARD
+# ═══════════════════════════════════════════════════════════════════════
+
+def _render_connection_wizard():
+    """Guide the user through connecting their Android device."""
+    st.markdown(
+        '<h1 style="text-align:center;background:linear-gradient(135deg,#00d4ff,#a855f7);'
+        '-webkit-background-clip:text;-webkit-text-fill-color:transparent;'
+        'font-weight:700;">'
+        '📲 Live Mode — Device Setup</h1>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Follow the steps below to connect your Android device")
+    st.divider()
+
+    # Check current device status
+    try:
+        connected = is_device_connected()
+    except Exception:
+        connected = False
+
+    if connected:
         try:
-            memory = get_system_memory()
-            processes = get_running_processes()
-            device_info = get_device_info()
-            return memory, processes, device_info, True
+            dev_info = get_device_info()
+            model = dev_info.get("model", "Android Device")
+            android_ver = dev_info.get("android_version", "")
         except Exception:
-            pass  # fall through to demo
+            model = "Android Device"
+            android_ver = ""
+        st.session_state.device_connected = True
+    else:
+        model = None
+        android_ver = None
 
-    # Demo fallback
-    memory = get_fake_memory()
-    processes = get_fake_processes()
-    device_info = get_fake_device_info()
-    return memory, processes, device_info, False
+    # Step indicators
+    def _wizard_step(number, title, description, status, result_text=""):
+        """Render a connection wizard step. status: 'done' | 'active' | 'pending'"""
+        if status == "done":
+            icon = "✅"
+            border_col = "rgba(16,185,129,0.5)"
+            bg = "rgba(16,185,129,0.06)"
+            label = "DONE"
+            label_col = "#10b981"
+        elif status == "active":
+            icon = "🔵"
+            border_col = "rgba(0,212,255,0.5)"
+            bg = "rgba(0,212,255,0.06)"
+            label = "IN PROGRESS"
+            label_col = "#00d4ff"
+        else:
+            icon = "⏳"
+            border_col = "rgba(255,255,255,0.1)"
+            bg = "rgba(255,255,255,0.02)"
+            label = "PENDING"
+            label_col = "rgba(255,255,255,0.35)"
+
+        result_html = ""
+        if result_text:
+            result_html = (
+                f'<div style="margin-top:8px;padding:8px 12px;'
+                f'background:rgba(16,185,129,0.10);border-radius:8px;'
+                f'font-weight:600;font-size:0.9rem;color:#10b981;">'
+                f'{result_text}</div>'
+            )
+
+        st.markdown(
+            f'<div style="background:{bg};border:1px solid {border_col};'
+            f'border-radius:14px;padding:18px 22px;margin-bottom:12px;'
+            f'backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);'
+            f'box-shadow:0 4px 20px rgba(0,0,0,0.25);">'
+            f'<div style="display:flex;align-items:center;gap:12px;">'
+            f'<span style="font-size:1.6rem;">{icon}</span>'
+            f'<div style="flex:1;">'
+            f'<span style="font-weight:700;font-size:1.05rem;color:#f0f0f0;">'
+            f'Step {number}: {title}</span><br/>'
+            f'<span style="font-size:0.85rem;color:rgba(255,255,255,0.55);">'
+            f'{description}</span></div>'
+            f'<span style="font-size:0.72rem;font-weight:600;padding:3px 10px;'
+            f'border-radius:20px;border:1px solid {label_col};color:{label_col};">'
+            f'{label}</span></div>'
+            f'{result_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    _, wizard_col, _ = st.columns([1, 3, 1])
+    with wizard_col:
+        if connected:
+            # All steps done
+            _wizard_step(1, "Connect Phone via USB",
+                         "Plug your Android device into this computer using a USB cable.",
+                         "done")
+            _wizard_step(2, "Enable USB Debugging",
+                         "Go to Settings → Developer Options → Enable USB Debugging. Tap \"Allow\" on the prompt.",
+                         "done")
+            _wizard_step(3, "Detecting Device…",
+                         "Waiting for ADB to recognise the connected device.",
+                         "done")
+
+            ver_text = f" (Android {android_ver})" if android_ver else ""
+            _wizard_step(4, "Device Detected",
+                         "Your device has been successfully identified.",
+                         "done",
+                         f"✅ {model}{ver_text} detected")
+
+            st.markdown("")
+            if st.button("🚀  Continue to Dashboard", type="primary", use_container_width=True):
+                st.rerun()
+        else:
+            # Steps 1 & 2 are instructions, step 3 is active (detecting)
+            _wizard_step(1, "Connect Phone via USB",
+                         "Plug your Android device into this computer using a USB cable.",
+                         "active")
+            _wizard_step(2, "Enable USB Debugging",
+                         "Go to Settings → Developer Options → Enable USB Debugging. Tap \"Allow\" on the prompt.",
+                         "pending")
+            _wizard_step(3, "Detecting Device…",
+                         "Waiting for ADB to recognise the connected device.",
+                         "pending")
+            _wizard_step(4, "Device Detected",
+                         "Your device will appear here once connected.",
+                         "pending")
+
+            st.markdown("")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🔄  Retry Detection", use_container_width=True):
+                    st.rerun()
+            with c2:
+                if st.button("← Back to Mode Selection", use_container_width=True):
+                    st.session_state.app_mode = None
+                    st.session_state.device_connected = False
+                    st.rerun()
+
+            st.markdown("")
+            st.info("💡 **Tip:** Make sure ADB is installed and your phone shows a USB debugging authorisation dialog. Tap **Allow** on the phone, then click **Retry Detection**.")
 
 
-memory, processes, device_info, is_live = collect_data()
+# ═══════════════════════════════════════════════════════════════════════
+#  MODE ROUTER — Decide what to show
+# ═══════════════════════════════════════════════════════════════════════
+
+# If no mode selected yet, show the selection screen and stop
+if st.session_state.app_mode is None:
+    _render_mode_selection()
+    st.stop()
+
+# Guard against invalid app_mode values
+if st.session_state.app_mode not in ("demo", "live"):
+    st.session_state.app_mode = None
+    st.rerun()
+
+# If live mode but device not yet connected, show the wizard and stop
+if st.session_state.app_mode == "live" and not st.session_state.device_connected:
+    _render_connection_wizard()
+    st.stop()
+
+# ── From here on, we're in an active dashboard session ───────────────
+
+is_live = st.session_state.app_mode == "live"
+
+if is_live:
+    try:
+        memory, processes, device_info = collect_live_data()
+    except Exception:
+        # Device was disconnected — bounce back to wizard
+        st.session_state.device_connected = False
+        st.warning("Device connection lost. Returning to setup…")
+        time.sleep(1)
+        st.rerun()
+        st.stop()
+    # Pre-trigger the *next* background fetch so it's ready before the
+    # next auto-refresh fires — the UI will never wait.
+    collect_live_data()
+else:
+    memory, processes, device_info = collect_demo_data()
 
 # Record history
 usage_pct = calculate_usage_percent(memory)
@@ -474,21 +778,34 @@ with st.sidebar:
     if is_live:
         st.success("🟢  LIVE — Device Connected")
     else:
-        st.warning("🟡  DEMO MODE — No Device")
+        st.info("🖥️  DEMO MODE")
 
     st.markdown(f"**Model:** {device_info.get('model', 'N/A')}")
     st.markdown(f"**Android:** {device_info.get('android_version', 'N/A')}")
     st.divider()
 
     if st.button("🔄 Refresh Now"):
-        collect_data.clear()
+        if is_live:
+            clear_live_cache()
+        else:
+            collect_demo_data.clear()
         st.rerun()
 
     st.toggle(
-        "Auto-Refresh (30s)",
+        "Auto-Refresh (15s)",
         key="auto_refresh_on",
-        help="Automatically refresh data every 30 seconds",
+        help="Automatically refresh data every 15 seconds",
     )
+
+    st.divider()
+
+    if st.button("🔀 Switch Mode"):
+        st.session_state.app_mode = None
+        st.session_state.device_connected = False
+        st.session_state.memory_history = []
+        if is_live:
+            clear_live_cache()
+        st.rerun()
 
     st.divider()
     st.caption("Built for OS Course Project")
@@ -504,7 +821,8 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════════════
 
 st.title("🧠 Mobile OS Memory Management System")
-st.caption("Real-time adaptive memory monitoring, analysis & optimization")
+_mode_label = "🟢 Live" if is_live else "🖥️ Demo"
+st.caption(f"Real-time adaptive memory monitoring, analysis & optimization — {_mode_label}")
 
 severity, rec_title, rec_detail = get_system_recommendation(usage_pct)
 
@@ -566,7 +884,7 @@ with tab_overview:
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="rgba(255,255,255,0.8)"),
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
     with p_col:
         st.subheader("System Status")
@@ -590,7 +908,7 @@ with tab_overview:
                 round(memory.lost_kb / 1024, 1),
             ],
         })
-        st.dataframe(breakdown, width='stretch', hide_index=True)
+        st.dataframe(breakdown, use_container_width=True, hide_index=True)
 
 
 # ─── Tab 2: Running Processes ────────────────────────────────────────
@@ -611,7 +929,7 @@ with tab_processes:
         df = pd.DataFrame(rows)
         st.dataframe(
             df.style.background_gradient(subset=["PSS (MB)"], cmap="OrRd"),
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
             height=420,
         )
@@ -640,7 +958,7 @@ with tab_processes:
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="rgba(255,255,255,0.8)"),
         )
-        st.plotly_chart(fig_bar, width='stretch')
+        st.plotly_chart(fig_bar, use_container_width=True)
 
         # Individual kill buttons
         st.subheader("Force Stop an App")
@@ -659,7 +977,7 @@ with tab_processes:
                         if ok:
                             st.session_state.last_killed = p.package_name
                             st.toast(f"Stopped {p.package_name}")
-                            collect_data.clear()
+                            clear_live_cache()
                             st.rerun()
                         else:
                             st.error(f"Failed to stop {p.package_name}")
@@ -672,34 +990,42 @@ with tab_processes:
 # ─── Tab 3: Memory History ───────────────────────────────────────────
 
 with tab_history:
-    st.subheader("RAM Usage Over Time")
-
     history = st.session_state.memory_history
     if len(history) >= 2:
         df_hist = pd.DataFrame(history)
-        # Line chart — used vs free
-        fig_line = go.Figure()
-        fig_line.add_trace(go.Scatter(
+        _total_mb = round(memory.total_kb / 1024, 1)
+
+        # 1 ─ RAM Usage — Absolute Scale (Total RAM ceiling, no fill)
+        st.subheader("RAM Usage (MB) — Absolute Scale")
+        fig_abs = go.Figure()
+        fig_abs.add_trace(go.Scatter(
             x=df_hist["time"], y=df_hist["used_mb"],
-            mode="lines+markers", name="Used (MB)",
+            mode="lines+markers", name="Used RAM",
             line=dict(color="#ec4899", width=2),
             marker=dict(size=5, color="#ec4899"),
-            fill="tonexty" if False else None,
         ))
-        fig_line.add_trace(go.Scatter(
+        fig_abs.add_trace(go.Scatter(
             x=df_hist["time"], y=df_hist["free_mb"],
-            mode="lines+markers", name="Free (MB)",
+            mode="lines+markers", name="Free RAM",
             line=dict(color="#10b981", width=2),
             marker=dict(size=5, color="#10b981"),
         ))
-        fig_line.update_layout(
+        fig_abs.add_hline(
+            y=_total_mb,
+            line_dash="dash", line_color="rgba(255,255,255,0.35)", line_width=1,
+            annotation_text=f"Total RAM ({_total_mb:.0f} MB)",
+            annotation_position="top left",
+            annotation_font=dict(color="rgba(255,255,255,0.55)", size=11),
+        )
+        fig_abs.update_layout(
             xaxis=dict(title="Time", gridcolor="rgba(255,255,255,0.06)",
                        tickfont=dict(color="rgba(255,255,255,0.6)"),
                        title_font=dict(color="rgba(255,255,255,0.7)")),
-            yaxis=dict(title="Memory (MB)", gridcolor="rgba(255,255,255,0.06)",
+            yaxis=dict(title="Memory (MB)", range=[0, _total_mb * 1.05],
+                       gridcolor="rgba(255,255,255,0.06)",
                        tickfont=dict(color="rgba(255,255,255,0.6)"),
                        title_font=dict(color="rgba(255,255,255,0.7)")),
-            height=400,
+            height=380,
             legend=dict(orientation="h", yanchor="bottom", y=1.02,
                         font=dict(color="rgba(255,255,255,0.8)")),
             margin=dict(t=40, b=40),
@@ -707,9 +1033,9 @@ with tab_history:
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="rgba(255,255,255,0.8)"),
         )
-        st.plotly_chart(fig_line, width='stretch')
+        st.plotly_chart(fig_abs, use_container_width=True)
 
-        # Usage % line
+        # 2 ─ Usage % Over Time
         st.subheader("Usage % Over Time")
         fig_pct = go.Figure(go.Scatter(
             x=df_hist["time"], y=df_hist["usage_pct"],
@@ -730,7 +1056,7 @@ with tab_history:
             plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="rgba(255,255,255,0.8)"),
         )
-        st.plotly_chart(fig_pct, width='stretch')
+        st.plotly_chart(fig_pct, use_container_width=True)
 
     # ── Kill Log ──────────────────────────────────────────────────────
     st.divider()
@@ -740,7 +1066,10 @@ with tab_history:
     if kill_log:
         # Most recent kills first
         df_log = pd.DataFrame(reversed(kill_log))
-        df_log.columns = ["Time", "Package", "Memory Freed (MB)", "Status"]
+        df_log = df_log.rename(columns={
+            "time": "Time", "package": "Package",
+            "pss_mb": "Memory Freed (MB)", "status": "Status",
+        })
 
         # Summary metrics
         _log_killed = [e for e in kill_log if "✅" in e["status"]]
@@ -785,7 +1114,7 @@ with tab_smart:
             pd.DataFrame(cand_rows).style.background_gradient(
                 subset=["PSS (MB)"], cmap="OrRd",
             ),
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
         )
 
@@ -848,7 +1177,7 @@ with tab_smart:
                         st.warning(f"Failed to stop: {', '.join(failed)}")
 
                     st.session_state.last_killed = f"{len(killed)} selected app(s)"
-                    collect_data.clear()
+                    clear_live_cache()
                     st.rerun()
 
         st.divider()
@@ -874,7 +1203,7 @@ with tab_smart:
                     if ok:
                         st.session_state.last_killed = c.package_name
                         st.toast(f"Stopped {c.package_name} (~{c.pss_mb} MB freed)")
-                        collect_data.clear()
+                        clear_live_cache()
                         st.rerun()
                     else:
                         st.error(f"Failed to stop {c.package_name}")
@@ -901,7 +1230,7 @@ with tab_smart:
             font=dict(color="rgba(255,255,255,0.8)"),
             legend=dict(font=dict(color="rgba(255,255,255,0.7)")),
         )
-        st.plotly_chart(fig_pie, width='stretch')
+        st.plotly_chart(fig_pie, use_container_width=True)
 
         # ── Optimize All button (improved) ─────────────────────────────
         if is_live:
@@ -931,7 +1260,7 @@ with tab_smart:
                 if failed:
                     st.warning(f"Could not stop: {', '.join(failed)}")
                 st.session_state.last_killed = f"{len(killed)}/{len(candidates)} apps"
-                collect_data.clear()
+                clear_live_cache()
                 st.rerun()
         else:
             st.info("Optimize button is disabled in demo mode.")
@@ -948,7 +1277,7 @@ with tab_compare:
     comparison = android_vs_model_comparison()
     st.dataframe(
         pd.DataFrame(comparison),
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
     )
 

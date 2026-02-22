@@ -168,8 +168,18 @@ def force_stop_batch(packages: list[str]) -> dict[str, bool]:
             timeout=max(ADB_TIMEOUT_SECONDS, len(packages) * 0.5 + 5),
             creationflags=_CREATION_FLAGS,
         )
-        # If the overall call succeeded, treat all as successful
-        return {p: True for p in packages}
+        if result.returncode != 0:
+            # Batch call failed — fall back to individual calls
+            results = {}
+            for p in packages:
+                results[p] = force_stop_app(p)
+            return results
+        # Check stderr for per-package errors
+        stderr_lower = (result.stderr or "").lower()
+        return {
+            p: p not in stderr_lower
+            for p in packages
+        }
     except (subprocess.TimeoutExpired, FileNotFoundError, RuntimeError):
         # Fallback: try individually
         results = {}

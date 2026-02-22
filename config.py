@@ -3,9 +3,9 @@ Configuration constants for the Mobile OS Memory Management System.
 """
 
 # ── Refresh & Timing ─────────────────────────────────────────────────
-REFRESH_INTERVAL_MS = 30000         # Dashboard auto-refresh interval (milliseconds)
+REFRESH_INTERVAL_MS = 15000         # Dashboard auto-refresh interval (milliseconds)
 ADB_TIMEOUT_SECONDS = 10            # Max wait time for any ADB command
-CACHE_TTL_SECONDS = 25              # How long to serve cached ADB data before re-fetching
+CACHE_TTL_SECONDS = 12              # How long to serve cached ADB data before re-fetching
 
 # ── Memory Thresholds (percentage) ───────────────────────────────────
 THRESHOLD_CRITICAL = 80             # >= 80 % → critical (red)
